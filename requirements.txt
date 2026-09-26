@@ -1,0 +1,6 @@
+Flask
+streamlit
+requests
+pytest
+PyYAML
+python-dotenv
