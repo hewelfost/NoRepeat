@@ -29,4 +29,7 @@ Thumbs.db
 
 # Archivos temporales
 *.tmp
-*.temp
+*.temp 
+
+#Repositorios y workspaces temporales analizados por NoRepeat
+workspaces/
