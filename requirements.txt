@@ -6,3 +6,4 @@ PyYAML
 python-dotenv
 Flask-Cors
 Flask-Limiter
+gunicorn
