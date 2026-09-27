@@ -88,4 +88,40 @@ NoRepeat meets the challenge requirements by deeply integrating Bob's core capab
 - Document Understanding: Used to read and interpret the human incident report (`.md`).
 - Parallel Tasks & Subagents: Separates incident analysis, code review, and test review into distinct agents to avoid context pollution.
 - Agent Mode (Edit & Execute): Writes test code, runs `pytest` in the terminal, reads the results (Fail), edits `app.py` to apply the patch, and runs the tests again (Success).
+
 Built in 48 hours for the IBM Bob 2.0 Hackathon hosted by lablab.ai
+
+## How to Use NoRepeat
+
+**NoRepeat turns yesterday’s incidents into tomorrow’s regression tests.** It transforms historical knowledge into executable tests and verifiable evidence to prevent root causes from repeating, even when standard tests pass.
+
+### Step-by-Step Workflow
+
+1. **Select Candidate Revision:** Load your GitHub repository and lock a specific branch, tag, or commit (e.g., the `recurrence-demo` branch). This ensures the audit is tied to an exact, reproducible version of the software.
+
+
+2. **Upload Historical Postmortem:** Upload an actual incident report (e.g., `postmortem.md`). NoRepeat registers the file's SHA-256 hash to preserve strict traceability.
+
+
+3. **Establish Baseline:** Run your existing test suite before any AI analysis occurs. A passing baseline demonstrates that the historical vulnerability is currently undetected by traditional pipelines.
+
+
+4. **Generate Incident Memory:** IBM Bob (the AI agent) processes the postmortem into structured "Incident Memory". It extracts the core root cause and the violated security property rather than simply memorizing keywords or endpoints.
+
+
+5. **Detect Semantic Recurrence:** Bob compares the Incident Memory against the candidate code to find semantic matches. It can detect the exact same root cause even if the implementation or endpoint names have changed.
+
+
+6. **Generate a Regression Guard:** If a recurrence is detected, Bob converts its natural language conclusion into a deterministic, executable regression test (e.g., `tests/generated/test_INC_042.py`).
+
+
+7. **Replay the Incident:** NoRepeat independently executes the newly generated regression guard. An intentional test failure proves that the historical incident can actually be reproduced in the current codebase.
+
+
+8. **Remediate:** Bob applies a minimal code fix to the necessary production files. NoRepeat strictly protects the generated test and historical evidence to prevent the AI from "fixing" the issue by deleting or weakening the test.
+
+
+9. **Verify Independently:** NoRepeat re-runs the regression guard alongside the full test suite. A successful run proves the historical incident can no longer be reproduced and that the new fix did not break existing features.
+
+
+10. **Generate Proof of Non-Recurrence:** Finally, NoRepeat generates a verified artifact (`proof_of_non_recurrence.json`). This document links the entire chain of evidence: the postmortem, persisted memory, candidate revision, replay, remediation, and final verification.

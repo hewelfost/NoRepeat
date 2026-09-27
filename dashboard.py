@@ -10,7 +10,7 @@ import streamlit as st
 
 API_BASE_URL = os.getenv(
     "NOREPEAT_API_URL",
-    "http://127.0.0.1:5000",
+    "http://norepeat-production.up.railway.app",
 )
 
 REQUEST_TIMEOUT = 120
