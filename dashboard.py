@@ -14,6 +14,7 @@ API_BASE_URL = os.getenv(
 )
 
 REQUEST_TIMEOUT = 120
+CLEANUP_TOKEN = os.getenv("NOREPEAT_CLEANUP_TOKEN", "").strip()
 
 
 # ---------------------------------------------------------------------
@@ -1452,6 +1453,42 @@ def check_backend_health() -> bool:
     )
 
 
+def _clear_session_query_param() -> None:
+    """Remove the resumable session identifier from the browser URL."""
+    if "session" in st.query_params:
+        del st.query_params["session"]
+
+
+def sync_local_state_from_status(status: dict | None) -> None:
+    """Keep Streamlit-local result state aligned with the backend manifest."""
+    status = status or {}
+    st.session_state.repository_loaded = bool(status.get("repository"))
+    st.session_state.incident_loaded = bool(status.get("incident"))
+    st.session_state.baseline_result = status.get("baseline")
+    st.session_state.incident_memory = status.get("incident_memory")
+    st.session_state.recurrence_analysis = status.get("recurrence_analysis")
+    st.session_state.replay_result = status.get("replay")
+    st.session_state.verification_result = status.get("verification")
+
+    proof = status.get("proof") or {}
+    if proof.get("status") == "VERIFIED":
+        st.session_state.proof_result = proof
+    elif proof.get("status") in {"PENDING", "READY", "FAILED"}:
+        st.session_state.proof_result = None
+
+
+def activate_session(manifest: dict) -> None:
+    """Activate a backend session and make it survive browser refreshes."""
+    session_id = manifest.get("session_id")
+    if not session_id:
+        return
+
+    st.session_state.session_id = session_id
+    st.session_state.session_status = manifest
+    sync_local_state_from_status(manifest)
+    st.query_params["session"] = session_id
+
+
 def refresh_session_status() -> dict | None:
     """Refresh the current NoRepeat session state."""
     session_id = st.session_state.session_id
@@ -1465,15 +1502,21 @@ def refresh_session_status() -> dict | None:
     )
 
     if payload:
-        st.session_state.session_status = payload["data"]
+        status = payload["data"]
+        st.session_state.session_status = status
+        sync_local_state_from_status(status)
+        st.query_params["session"] = session_id
 
     return payload
 
 
-def reset_local_state() -> None:
-    """Reset the local Streamlit state."""
+def reset_local_state(*, clear_query: bool = True) -> None:
+    """Reset local Streamlit state and optionally clear the resumable URL."""
     for key, default_value in DEFAULT_STATE.items():
         st.session_state[key] = default_value
+
+    if clear_query:
+        _clear_session_query_param()
 
 
 # ---------------------------------------------------------------------
@@ -1563,29 +1606,58 @@ def show_pytest_result(
 
 
 def display_workflow_status() -> None:
-    """Display the historical-recurrence workflow progress."""
+    """Display workflow progress without marking failed operations as complete."""
     status = st.session_state.session_status or {}
     current_status = status.get("status", "NOT_STARTED")
 
+    baseline = status.get("baseline")
+    recurrence = status.get("recurrence_analysis")
+    replay = status.get("replay")
+    verification = status.get("verification")
+    proof = status.get("proof") or {}
+
     steps = [
-        ("Candidate", bool(status.get("repository"))),
-        ("Postmortem", bool(status.get("incident"))),
-        ("Baseline", bool(status.get("baseline_completed"))),
-        ("Memory", bool(status.get("incident_memory_ready"))),
-        ("Recurrence", bool(status.get("recurrence_analysis_completed"))),
-        ("Replay", bool(status.get("incident_replay_completed"))),
-        ("Verify", bool(status.get("verification_completed"))),
-        ("Proof", status.get("proof", {}).get("status") == "VERIFIED"),
+        ("Candidate", "done" if status.get("repository") else "pending"),
+        ("Postmortem", "done" if status.get("incident") else "pending"),
+        (
+            "Baseline",
+            "done" if baseline and baseline.get("success")
+            else "failed" if baseline is not None
+            else "pending",
+        ),
+        ("Memory", "done" if status.get("incident_memory_ready") else "pending"),
+        (
+            "Recurrence",
+            "detected" if recurrence and recurrence.get("detected")
+            else "done" if recurrence is not None
+            else "pending",
+        ),
+        (
+            "Replay",
+            "detected" if replay and replay.get("incident_reproduced")
+            else "failed" if replay is not None
+            else "pending",
+        ),
+        (
+            "Verify",
+            "done" if verification and verification.get("verified")
+            else "failed" if verification is not None
+            else "pending",
+        ),
+        ("Proof", "done" if proof.get("status") == "VERIFIED" else "pending"),
     ]
 
     st.subheader("Historical recurrence workflow")
-
     first_row = st.columns(4)
     second_row = st.columns(4)
 
-    for column, (name, completed) in zip(first_row + second_row, steps):
-        if completed:
+    for column, (name, state) in zip(first_row + second_row, steps):
+        if state == "done":
             column.success(f"✓ {name}")
+        elif state == "detected":
+            column.warning(f"! {name}")
+        elif state == "failed":
+            column.error(f"✕ {name}")
         else:
             column.info(f"○ {name}")
 
@@ -1608,6 +1680,26 @@ def show_repository_summary(status: dict | None) -> None:
     cols[0].metric("Source", source_type.upper())
     cols[1].metric("Revision", revision or "default")
     cols[2].metric("Commit", commit_sha[:10] if commit_sha else "snapshot")
+
+
+# ---------------------------------------------------------------------
+# Resume session after browser refresh
+# ---------------------------------------------------------------------
+
+if not st.session_state.session_id:
+    query_session = st.query_params.get("session")
+    if isinstance(query_session, list):
+        query_session = query_session[0] if query_session else None
+
+    if isinstance(query_session, str) and query_session.strip():
+        payload = api_request(
+            "GET",
+            f"/api/sessions/{query_session.strip()}",
+        )
+        if payload:
+            activate_session(payload["data"])
+        else:
+            _clear_session_query_param()
 
 
 # ---------------------------------------------------------------------
@@ -1703,6 +1795,42 @@ with st.sidebar:
                 reset_local_state()
                 st.rerun()
 
+    st.divider()
+    with st.expander("Maintenance / clean runtime data"):
+        st.caption(
+            "Deletes generated sessions, cloned repositories, runtime evidence and "
+            "caches. Preserves .bob/, AGENTS.md, bob_sessions/, data/guards/ and "
+            "data/incidents/. Learned incident memories are archived to data/guards/."
+        )
+        cleanup_confirmed = st.checkbox(
+            "I understand this will remove all active runtime sessions.",
+            key="cleanup_runtime_confirmed",
+        )
+        if st.button(
+            "Clean generated runtime data",
+            disabled=not cleanup_confirmed,
+            use_container_width=True,
+        ):
+            headers = {}
+            if CLEANUP_TOKEN:
+                headers["X-NoRepeat-Cleanup-Token"] = CLEANUP_TOKEN
+
+            payload = api_request(
+                "POST",
+                "/api/runtime/cleanup",
+                headers=headers,
+            )
+            if payload:
+                report = payload.get("data") or {}
+                reset_local_state()
+                st.success(
+                    "Runtime data cleaned. "
+                    f"Sessions removed: {report.get('workspaces_removed', 0)}. "
+                    f"Incident memories archived: "
+                    f"{len(report.get('archived_incident_memories', []))}."
+                )
+                st.rerun()
+
 # ---------------------------------------------------------------------
 # Step 1 - Candidate code
 # ---------------------------------------------------------------------
@@ -1777,9 +1905,7 @@ elif repository_source == "GitHub repository":
 
             if payload:
                 manifest = payload["data"]
-                st.session_state.session_id = manifest["session_id"]
-                st.session_state.repository_loaded = True
-                st.session_state.session_status = manifest
+                activate_session(manifest)
                 st.rerun()
 
 elif repository_source == "ZIP upload":
@@ -1809,9 +1935,7 @@ elif repository_source == "ZIP upload":
 
             if payload:
                 manifest = payload["data"]
-                st.session_state.session_id = manifest["session_id"]
-                st.session_state.repository_loaded = True
-                st.session_state.session_status = manifest
+                activate_session(manifest)
                 st.rerun()
 
 uploaded_zip_name = uploaded_zip.name if uploaded_zip is not None else None
@@ -1995,7 +2119,11 @@ st.markdown(
 
 recurrence = current_status.get("recurrence_analysis")
 if recurrence:
-    if recurrence.get("detected"):
+    recurrence_detected = recurrence.get("detected")
+    if recurrence_detected is None:
+        recurrence_detected = recurrence.get("recurrence_detected")
+
+    if recurrence_detected:
         st.error("Historical recurrence detected.")
     else:
         st.success("No known historical recurrence detected for this candidate.")
@@ -2029,7 +2157,13 @@ incident_test_path = st.text_input(
     value="tests/generated/test_INC_042.py",
 )
 
-replay_enabled = bool(recurrence and recurrence.get("detected"))
+replay_enabled = bool(
+    recurrence
+    and (
+        recurrence.get("detected") is True
+        or recurrence.get("recurrence_detected") is True
+    )
+)
 if st.button("Run incident replay", disabled=not replay_enabled):
     with st.spinner("Replaying historical recurrence..."):
         payload = api_request(

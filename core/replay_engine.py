@@ -260,10 +260,22 @@ def run_pytest(
 def run_full_test_suite(
     session_id: str,
     evidence_label: str | None = None,
+    *,
+    exclude_generated_tests: bool = False,
 ) -> dict:
+    """Run the repository test suite.
+
+    Baseline runs can exclude Bob-generated regression tests so stale/generated
+    guards never contaminate the candidate's original test baseline.
+    """
+    extra_args = None
+    if exclude_generated_tests:
+        extra_args = ["--ignore=tests/generated"]
+
     return run_pytest(
         session_id=session_id,
         evidence_label=evidence_label,
+        extra_args=extra_args,
     )
 
 

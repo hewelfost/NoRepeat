@@ -8,6 +8,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
+from core.cleanup_manager import cleanup_generated_runtime_data
 from core.incident_manager import (
     IncidentManagerError,
     InvalidIncidentFileError,
@@ -78,6 +79,17 @@ def get_json_body() -> dict:
     return body
 
 
+def require_cleanup_authorization() -> None:
+    """Protect destructive runtime cleanup when a token is configured."""
+    expected_token = os.getenv("NOREPEAT_CLEANUP_TOKEN", "").strip()
+    if not expected_token:
+        return
+
+    supplied_token = request.headers.get("X-NoRepeat-Cleanup-Token", "")
+    if supplied_token != expected_token:
+        raise PermissionError("Invalid cleanup authorization token.")
+
+
 @app.get("/")
 def root():
     return api_response(
@@ -98,6 +110,20 @@ def health():
             "workflow": "historical-recurrence",
         },
         message="NoRepeat backend is running.",
+    )
+
+
+@app.post("/api/runtime/cleanup")
+def cleanup_runtime():
+    """Delete generated runtime artifacts while preserving Bob assets/memory."""
+    require_cleanup_authorization()
+    report = cleanup_generated_runtime_data()
+    return api_response(
+        data=report,
+        message=(
+            "Generated runtime data cleaned successfully. "
+            "Bob configuration, task evidence and durable incident memory were preserved."
+        ),
     )
 
 
@@ -409,6 +435,14 @@ def handle_value_error(error: ValueError):
     return api_response(
         message=str(error),
         status_code=400,
+    )
+
+
+@app.errorhandler(PermissionError)
+def handle_permission_error(error: PermissionError):
+    return api_response(
+        message=str(error),
+        status_code=403,
     )
 
 

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.cleanup_manager import remove_session_evidence
 from core.incident_manager import (
     get_session_workspace,
     import_incident_file,
@@ -209,6 +210,7 @@ def set_candidate_revision(
     manifest["repository"] = repository
 
     _clear_candidate_results(manifest)
+    remove_session_evidence(session_id)
     manifest["status"] = _status_after_candidate_reset(manifest)
     _save_manifest(session_id, manifest)
     return manifest
@@ -307,6 +309,7 @@ def run_baseline(
     result = run_full_test_suite(
         session_id=session_id,
         evidence_label="baseline",
+        exclude_generated_tests=True,
     )
 
     result["candidate_commit_sha"] = (
@@ -383,9 +386,14 @@ def record_recurrence_analysis(
     _require_incident(manifest)
     _require_incident_memory(manifest)
 
-    if manifest.get("baseline") is None:
+    baseline = manifest.get("baseline")
+    if baseline is None:
         raise InvalidSessionStateError(
             "Run the project baseline before recording recurrence analysis."
+        )
+    if not baseline.get("success"):
+        raise InvalidSessionStateError(
+            "The candidate baseline must pass before recurrence analysis can be recorded."
         )
 
     if not isinstance(analysis, dict) or not analysis:
@@ -393,14 +401,28 @@ def record_recurrence_analysis(
             "Recurrence analysis must be a non-empty JSON object."
         )
 
+    # Bob's analysis schema uses recurrence_detected. Older/manual integration
+    # used detected. Accept both, reject conflicts, and normalize to detected so
+    # the rest of NoRepeat has one canonical field.
     detected = analysis.get("detected")
+    bob_detected = analysis.get("recurrence_detected")
+
+    if detected is None:
+        detected = bob_detected
+    elif isinstance(bob_detected, bool) and bob_detected != detected:
+        raise OrchestratorError(
+            "Recurrence analysis contains conflicting detection fields."
+        )
+
     if not isinstance(detected, bool):
         raise OrchestratorError(
-            "Recurrence analysis must include a boolean 'detected' field."
+            "Recurrence analysis must include boolean 'detected' or "
+            "'recurrence_detected'."
         )
 
     repository = manifest.get("repository") or {}
     enriched = dict(analysis)
+    enriched["detected"] = detected
     enriched.update(
         {
             "recorded_at": _utc_now(),
@@ -445,21 +467,32 @@ def replay_incident(
         evidence_label="before-fix",
     )
 
+    counters = result.get("results") or {}
+    incident_reproduced = (
+        result.get("status") == "FAIL"
+        and result.get("return_code") == 1
+        and int(counters.get("failed", 0)) > 0
+        and int(counters.get("errors", 0)) == 0
+    )
+    replay_valid = result.get("status") in {"PASS", "FAIL"}
+
     replay_data = {
         "test_path": incident_test_path,
         "pytest": result,
-        "incident_reproduced": not result["success"],
+        "incident_reproduced": incident_reproduced,
+        "replay_valid": replay_valid,
         "candidate_commit_sha": (
             manifest.get("repository", {}).get("commit_sha")
         ),
     }
 
     manifest["replay"] = replay_data
-    manifest["status"] = (
-        "INCIDENT_REPRODUCED"
-        if replay_data["incident_reproduced"]
-        else "INCIDENT_NOT_REPRODUCED"
-    )
+    if incident_reproduced:
+        manifest["status"] = "INCIDENT_REPRODUCED"
+    elif replay_valid:
+        manifest["status"] = "INCIDENT_NOT_REPRODUCED"
+    else:
+        manifest["status"] = "REPLAY_ERROR"
     _save_manifest(session_id, manifest)
     return replay_data
 
@@ -478,6 +511,13 @@ def verify_after_fix(
     if not replay or not replay.get("incident_reproduced"):
         raise InvalidSessionStateError(
             "The historical recurrence must be reproduced before verification."
+        )
+
+    replay_test = Path(str(replay.get("test_path", ""))).as_posix().strip()
+    requested_test = Path(incident_test_path).as_posix().strip()
+    if not replay_test or replay_test != requested_test:
+        raise InvalidSessionStateError(
+            "Verification must use the same regression test that reproduced the incident."
         )
 
     incident_result = run_incident_replay(
@@ -573,13 +613,25 @@ def generate_proof_of_non_recurrence(
         "incident_memory": {
             "incident_id": memory.get("incident_id"),
             "root_cause": memory.get("root_cause"),
-            "security_property": memory.get("security_property"),
-            "historical_pattern": memory.get("historical_pattern"),
+            "security_property": (
+                memory.get("security_property")
+                or memory.get("violated_security_property")
+            ),
+            "historical_pattern": (
+                memory.get("historical_pattern")
+                or memory.get("historical_failure_pattern")
+            ),
         },
         "recurrence_analysis": {
             "detected": recurrence.get("detected"),
-            "summary": recurrence.get("summary"),
-            "evidence": recurrence.get("evidence"),
+            "summary": (
+                recurrence.get("summary")
+                or recurrence.get("semantic_correlation")
+            ),
+            "evidence": (
+                recurrence.get("evidence")
+                or recurrence.get("candidate_evidence")
+            ),
         },
         "original_replay": {
             "incident_reproduced": replay.get("incident_reproduced"),
@@ -651,4 +703,7 @@ def get_session_status(
 
 
 def delete_session(session_id: str) -> bool:
-    return remove_session_workspace(session_id)
+    removed = remove_session_workspace(session_id)
+    if removed:
+        remove_session_evidence(session_id)
+    return removed

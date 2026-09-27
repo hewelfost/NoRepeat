@@ -248,10 +248,12 @@ def _try_resolve_revision(
     revision: str,
 ) -> str | None:
     """Resolve a revision to a commit SHA using local and origin refs."""
-    candidates = [revision]
-
-    if not revision.startswith("origin/"):
-        candidates.append(f"origin/{revision}")
+    if revision.startswith("origin/"):
+        candidates = [revision]
+    else:
+        # Prefer the freshly fetched remote branch when both a local branch and
+        # origin/<branch> exist. This prevents stale local refs from winning.
+        candidates = [f"origin/{revision}", revision]
 
     for candidate in candidates:
         result = _run_git(
@@ -289,21 +291,20 @@ def checkout_repository_revision(
             "commit_sha": commit_sha,
         }
 
+    # Always refresh remote refs before resolving a user-selected revision.
+    # Resolving the local ref first can leave NoRepeat pinned to a stale branch
+    # after new commits are pushed to GitHub.
+    if fetch_if_missing:
+        _run_git(
+            repository_path,
+            ["fetch", "--all", "--prune", "--tags"],
+            timeout=120,
+        )
+
     commit_sha = _try_resolve_revision(
         repository_path,
         requested_revision,
     )
-
-    if commit_sha is None and fetch_if_missing:
-        _run_git(
-            repository_path,
-            ["fetch", "--all", "--prune"],
-            timeout=120,
-        )
-        commit_sha = _try_resolve_revision(
-            repository_path,
-            requested_revision,
-        )
 
     if commit_sha is None:
         raise InvalidRevisionError(
@@ -407,6 +408,20 @@ def switch_session_revision(
         raise InvalidRevisionError(
             "Revision switching is available only for Git repositories."
         )
+
+    # The session repository is a disposable audit clone. Remove modifications
+    # and untracked/ignored artifacts from the previous candidate before the
+    # checkout so generated tests or pytest caches cannot contaminate the next
+    # baseline.
+    head_check = _run_git(
+        repository_path,
+        ["rev-parse", "--verify", "HEAD"],
+        timeout=15,
+        check=False,
+    )
+    if head_check.returncode == 0:
+        _run_git(repository_path, ["reset", "--hard", "HEAD"], timeout=30)
+    _run_git(repository_path, ["clean", "-fdx"], timeout=30)
 
     revision_metadata = checkout_repository_revision(
         repository_path,
