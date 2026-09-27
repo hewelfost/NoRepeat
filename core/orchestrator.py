@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -206,6 +207,7 @@ def _create_manifest(
         "recurrence_analysis": None,
         "regression_guard": None,
         "replay": None,
+        "remediation": None,
         "verification": None,
         "proof": {
             "status": "PENDING",
@@ -248,6 +250,7 @@ def _clear_candidate_results(
     manifest["recurrence_analysis"] = None
     manifest["regression_guard"] = None
     manifest["replay"] = None
+    manifest["remediation"] = None
     manifest["verification"] = None
     manifest["proof"] = {"status": "PENDING"}
 
@@ -759,6 +762,7 @@ def record_recurrence_analysis(
     manifest["recurrence_analysis"] = enriched
     manifest["regression_guard"] = None
     manifest["replay"] = None
+    manifest["remediation"] = None
     manifest["verification"] = None
     manifest["proof"] = {"status": "PENDING"}
     manifest["status"] = (
@@ -932,6 +936,7 @@ At the end report only:
 
     manifest["regression_guard"] = guard
     manifest["replay"] = None
+    manifest["remediation"] = None
     manifest["verification"] = None
     manifest["proof"] = {"status": "PENDING"}
     manifest["status"] = "REGRESSION_GUARD_READY"
@@ -953,6 +958,12 @@ def replay_incident(
     _require_incident_memory(manifest)
     _require_recurrence(manifest)
     guard = _require_regression_guard(manifest)
+
+    if manifest.get("remediation"):
+        raise InvalidSessionStateError(
+            "The candidate has already been remediated. Preserve the original "
+            "pre-remediation replay evidence and continue with verification."
+        )
 
     expected_test_path = str(guard.get("test_path") or "").strip()
     if not expected_test_path:
@@ -989,6 +1000,9 @@ def replay_incident(
     }
 
     manifest["replay"] = replay_data
+    manifest["remediation"] = None
+    manifest["verification"] = None
+    manifest["proof"] = {"status": "PENDING"}
     if incident_reproduced:
         manifest["status"] = "INCIDENT_REPRODUCED"
     elif replay_valid:
@@ -998,6 +1012,262 @@ def replay_incident(
     _save_manifest(session_id, manifest)
     return replay_data
 
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _repository_file_hashes(repository_path: Path) -> dict[str, str]:
+    """Hash relevant repository files so Bob's remediation can be audited."""
+    hashes: dict[str, str] = {}
+    ignored_parts = {
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+    ignored_names = {".coverage", "coverage.xml"}
+
+    for path in repository_path.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(repository_path)
+        if any(part in ignored_parts for part in relative.parts):
+            continue
+        if path.name in ignored_names or path.suffix in {".pyc", ".pyo"}:
+            continue
+        try:
+            hashes[relative.as_posix()] = _sha256_file(path)
+        except OSError as exc:
+            raise OrchestratorError(
+                f"Unable to fingerprint candidate file during remediation: {path}"
+            ) from exc
+    return hashes
+
+
+def _changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    keys = set(before) | set(after)
+    return sorted(key for key in keys if before.get(key) != after.get(key))
+
+
+def remediate_with_bob(
+    session_id: str,
+) -> dict[str, Any]:
+    """Ask IBM Bob to apply only the smallest justified production-code fix."""
+    manifest = load_session_manifest(session_id)
+    _require_incident(manifest)
+    _require_incident_memory(manifest)
+    analysis = _require_recurrence(manifest)
+    guard = _require_regression_guard(manifest)
+
+    replay = manifest.get("replay") or {}
+    if not replay.get("incident_reproduced"):
+        raise InvalidSessionStateError(
+            "The historical recurrence must be reproduced by the generated guard "
+            "before IBM Bob is allowed to remediate it."
+        )
+
+    existing_remediation = manifest.get("remediation")
+    existing_verification = manifest.get("verification") or {}
+    if existing_remediation and not (
+        existing_verification and not existing_verification.get("verified")
+    ):
+        raise InvalidSessionStateError(
+            "IBM Bob remediation has already been applied. Run independent "
+            "verification before requesting another remediation attempt."
+        )
+
+    repository_path = Path(
+        str((manifest.get("repository") or {}).get("repository_path", ""))
+    ).resolve()
+    if not repository_path.exists() or not repository_path.is_dir():
+        raise OrchestratorError(
+            "The candidate repository referenced by this session no longer exists."
+        )
+
+    memory_path_raw = (manifest.get("incident_memory") or {}).get("memory_path")
+    if not memory_path_raw:
+        raise OrchestratorError("Persisted incident memory path is missing.")
+    memory_path = Path(str(memory_path_raw)).resolve()
+    if not memory_path.exists():
+        raise OrchestratorError("Persisted incident memory file no longer exists.")
+
+    workspace = get_session_workspace(session_id)
+    recurrence_path = workspace / "analysis" / "recurrence.json"
+    if not recurrence_path.exists():
+        recurrence_payload = {
+            key: value
+            for key, value in analysis.items()
+            if key not in {"bob_execution", "evidence_path", "recorded_at"}
+        }
+        recurrence_path.parent.mkdir(parents=True, exist_ok=True)
+        recurrence_path.write_text(
+            json.dumps(recurrence_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    guard_test_path = str(guard.get("test_path") or "").strip()
+    if not guard_test_path:
+        raise OrchestratorError("Generated regression guard path is missing.")
+    guard_path = (repository_path / guard_test_path).resolve()
+    try:
+        guard_path.relative_to(repository_path)
+    except ValueError as exc:
+        raise OrchestratorError(
+            "Generated regression guard resolves outside the candidate repository."
+        ) from exc
+    if not guard_path.exists() or not guard_path.is_file():
+        raise OrchestratorError(
+            f"Generated regression guard no longer exists: {guard_test_path}"
+        )
+
+    before_repo = _repository_file_hashes(repository_path)
+    before_tests = {
+        path: digest
+        for path, digest in before_repo.items()
+        if path == "tests" or path.startswith("tests/")
+    }
+    guard_sha_before = _sha256_file(guard_path)
+    memory_sha_before = _sha256_file(memory_path)
+    recurrence_sha_before = _sha256_file(recurrence_path)
+
+    memory_ref = _project_relative(memory_path)
+    recurrence_ref = _project_relative(recurrence_path)
+    repository_ref = _project_relative(repository_path)
+    guard_ref = _project_relative(guard_path)
+
+    prompt = f"""
+Perform only the Remediate phase for NoRepeat session {session_id}.
+
+Historical Incident Memory:
+@{memory_ref}
+
+Persisted recurrence analysis:
+@{recurrence_ref}
+
+Candidate repository:
+@{repository_ref}
+
+Failing regression guard that independently reproduced the historical recurrence:
+@{guard_ref}
+
+Goal:
+Apply the smallest justified production-code remediation that restores the historical
+security property while preserving the regression evidence and unrelated behavior.
+
+Rules:
+- Modify only candidate production/application code required for the fix.
+- Do not modify, delete, rename, skip, xfail, weaken, or replace any test file.
+- The generated regression guard is immutable evidence.
+- Do not modify Incident Memory, recurrence.json, NoRepeat manifests, or evidence files.
+- Do not add a second workaround test or bypass the failing assertion.
+- Do not perform unrelated refactors or formatting sweeps.
+- Do not commit, push, or change Git branches.
+- Preserve existing public behavior except where the historical security property
+  requires the minimal change.
+- You may inspect existing code and test conventions.
+- You may run the generated regression test for feedback, but NoRepeat will perform
+  the independent final verification and full-suite run after you finish.
+
+At the end report only:
+- files changed
+- minimal remediation applied
+- historical security property restored
+- regression test preserved: yes/no
+""".strip()
+
+    bob_result = get_bob_runner().run_norepeat(
+        prompt,
+        max_cost=0.70,
+        max_turns=10,
+        timeout_seconds=900,
+        allow_subagents=False,
+    )
+
+    after_repo = _repository_file_hashes(repository_path)
+    after_tests = {
+        path: digest
+        for path, digest in after_repo.items()
+        if path == "tests" or path.startswith("tests/")
+    }
+
+    if before_tests != after_tests:
+        changed_tests = _changed_paths(before_tests, after_tests)
+        raise OrchestratorError(
+            "IBM Bob modified protected test evidence during remediation. "
+            "NoRepeat rejected the remediation. Changed test path(s): "
+            + ", ".join(changed_tests)
+        )
+
+    if _sha256_file(guard_path) != guard_sha_before:
+        raise OrchestratorError(
+            "IBM Bob changed the generated regression guard during remediation. "
+            "NoRepeat rejected the remediation."
+        )
+
+    if _sha256_file(memory_path) != memory_sha_before:
+        raise OrchestratorError(
+            "IBM Bob changed persisted Incident Memory during remediation. "
+            "NoRepeat rejected the remediation."
+        )
+
+    if _sha256_file(recurrence_path) != recurrence_sha_before:
+        raise OrchestratorError(
+            "IBM Bob changed recurrence evidence during remediation. "
+            "NoRepeat rejected the remediation."
+        )
+
+    changed_files = _changed_paths(before_repo, after_repo)
+    production_changes = [
+        path for path in changed_files if not path.startswith("tests/")
+    ]
+    if not production_changes:
+        raise OrchestratorError(
+            "IBM Bob completed remediation without changing candidate production code."
+        )
+
+    attempt = 1
+    if isinstance(existing_remediation, dict):
+        attempt = int(existing_remediation.get("attempt", 0) or 0) + 1
+
+    remediation = {
+        "status": "APPLIED",
+        "attempt": attempt,
+        "applied_at": _utc_now(),
+        "changed_files": production_changes,
+        "all_repository_changes": changed_files,
+        "regression_guard_path": guard_test_path,
+        "regression_guard_sha256": guard_sha_before,
+        "protected_tests_preserved": True,
+        "incident_memory_preserved": True,
+        "recurrence_evidence_preserved": True,
+        "candidate_commit_sha": (
+            manifest.get("repository", {}).get("commit_sha")
+        ),
+        "bob_execution": {
+            "task_id": bob_result.task_id,
+            "status": bob_result.status,
+            "stats": bob_result.stats,
+            "last_message": bob_result.last_message,
+        },
+    }
+
+    manifest["remediation"] = remediation
+    manifest["verification"] = None
+    manifest["proof"] = {"status": "PENDING"}
+    manifest["status"] = "BOB_REMEDIATION_APPLIED"
+    _save_manifest(session_id, manifest)
+
+    return {
+        "remediation": remediation,
+        "bob": bob_result.to_dict(),
+    }
 
 def verify_after_fix(
     session_id: str,
@@ -1015,11 +1285,32 @@ def verify_after_fix(
             "The historical recurrence must be reproduced before verification."
         )
 
+    remediation = manifest.get("remediation") or {}
+    if remediation.get("status") != "APPLIED":
+        raise InvalidSessionStateError(
+            "IBM Bob must apply remediation before independent verification."
+        )
+
     replay_test = Path(str(replay.get("test_path", ""))).as_posix().strip()
     requested_test = Path(incident_test_path).as_posix().strip()
     if not replay_test or replay_test != requested_test:
         raise InvalidSessionStateError(
             "Verification must use the same regression test that reproduced the incident."
+        )
+
+    repository_path = Path(
+        str((manifest.get("repository") or {}).get("repository_path", ""))
+    ).resolve()
+    guard_path = (repository_path / requested_test).resolve()
+    expected_guard_sha = str(remediation.get("regression_guard_sha256") or "")
+    if not guard_path.exists() or not guard_path.is_file():
+        raise OrchestratorError(
+            "The immutable regression guard is missing before verification."
+        )
+    if expected_guard_sha and _sha256_file(guard_path) != expected_guard_sha:
+        raise InvalidSessionStateError(
+            "The regression guard changed after remediation. Verification was blocked "
+            "to preserve evidence integrity."
         )
 
     incident_result = run_incident_replay(
@@ -1043,9 +1334,15 @@ def verify_after_fix(
         "full_test_suite": full_suite_result,
         "verified": verified,
         "verified_at": _utc_now() if verified else None,
+        "remediation_attempt": remediation.get("attempt"),
+        "regression_guard_sha256": expected_guard_sha,
     }
 
     manifest["verification"] = verification
+    manifest["remediation"]["verification_status"] = (
+        "VERIFIED" if verified else "FAILED"
+    )
+    manifest["remediation"]["verified_at"] = verification["verified_at"]
 
     if verified:
         manifest["status"] = "NON_RECURRENCE_VERIFIED"
@@ -1084,6 +1381,16 @@ def generate_proof_of_non_recurrence(
     if not verification:
         raise InvalidSessionStateError(
             "Post-fix verification evidence is missing."
+        )
+    if not verification.get("verified"):
+        raise InvalidSessionStateError(
+            "Proof of Non-Recurrence requires a passing independent verification."
+        )
+
+    remediation = manifest.get("remediation") or {}
+    if remediation.get("status") != "APPLIED":
+        raise InvalidSessionStateError(
+            "Proof of Non-Recurrence requires recorded IBM Bob remediation evidence."
         )
 
     repository = manifest["repository"]
@@ -1138,6 +1445,24 @@ def generate_proof_of_non_recurrence(
         "original_replay": {
             "incident_reproduced": replay.get("incident_reproduced"),
             "test_path": replay.get("test_path"),
+        },
+        "remediation": {
+            "status": remediation.get("status"),
+            "attempt": remediation.get("attempt"),
+            "applied_at": remediation.get("applied_at"),
+            "changed_files": remediation.get("changed_files"),
+            "protected_tests_preserved": remediation.get(
+                "protected_tests_preserved"
+            ),
+            "incident_memory_preserved": remediation.get(
+                "incident_memory_preserved"
+            ),
+            "recurrence_evidence_preserved": remediation.get(
+                "recurrence_evidence_preserved"
+            ),
+            "bob_task_id": (remediation.get("bob_execution") or {}).get(
+                "task_id"
+            ),
         },
         "verification": {
             "incident_test_passed": verification["incident_test"]["success"],
@@ -1200,6 +1525,8 @@ def get_session_status(
         "regression_guard_ready": manifest.get("regression_guard") is not None,
         "incident_replay_completed": manifest.get("replay") is not None,
         "replay": manifest.get("replay"),
+        "remediation_completed": manifest.get("remediation") is not None,
+        "remediation": manifest.get("remediation"),
         "verification_completed": manifest.get("verification") is not None,
         "verification": manifest.get("verification"),
         "proof": manifest.get("proof"),

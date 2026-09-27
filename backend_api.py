@@ -36,6 +36,7 @@ from core.orchestrator import (
     learn_incident_with_bob,
     record_incident_memory,
     record_recurrence_analysis,
+    remediate_with_bob,
     replay_incident,
     run_baseline,
     set_candidate_revision,
@@ -310,6 +311,18 @@ def bob_generate_regression_guard(session_id: str):
     return api_response(
         data=result,
         message="IBM Bob generated and registered the historical regression guard.",
+    )
+
+
+@app.post("/api/sessions/<session_id>/bob/remediate")
+def bob_remediate(session_id: str):
+    result = remediate_with_bob(session_id=session_id)
+    return api_response(
+        data=result,
+        message=(
+            "IBM Bob applied the minimal remediation while preserving "
+            "the regression evidence."
+        ),
     )
 
 
