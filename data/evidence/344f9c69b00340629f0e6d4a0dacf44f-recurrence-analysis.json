@@ -1,0 +1,39 @@
+{
+  "incident_id": "INC-042",
+  "recurrence_detected": true,
+  "confidence": "high",
+  "historical_root_cause": "State-changing endpoints (/move, /reset) in the original incident accepted requests without verifying caller identity. No server-side authorization check was performed before game state was mutated, allowing any network-reachable client to alter live game state.",
+  "violated_security_property": "Every operation capable of modifying game state must require trusted, server-side authorization before it is executed.",
+  "candidate_evidence": {
+    "recurrence_site": "backend/app.py, lines 36-39",
+    "description": "The /update endpoint (POST) calls game.update() directly without any call to check_auth() or any other server-side authorization check. game.update() mutates ball_x, ball_y, ball_vx, ball_vy, score1, and score2 — all live game-state fields — before the mutation is executed, with no identity verification of the caller.",
+    "code_excerpt": "@app.route('/update', methods=['POST'])\n@limiter.limit('15 per second')\ndef update():\n    return jsonify(game.update())",
+    "contrast_with_protected_endpoints": "/move (lines 23-34) and /reset (lines 41-47) both call check_auth() at their first line and return 401 if authorization fails, before any state mutation. /update performs no equivalent check.",
+    "game_update_mutations": [
+      "game.py line 33: self.ball_x += self.ball_vx",
+      "game.py line 34: self.ball_y += self.ball_vy",
+      "game.py line 37: self.ball_vy *= -1 (conditional wall bounce)",
+      "game.py line 41: self.ball_vx *= -1 (conditional paddle bounce)",
+      "game.py line 43: self.score2 += 1 (score mutation on miss)",
+      "game.py line 44: self._reset_ball() (ball position/velocity reset)",
+      "game.py line 49: self.ball_vx *= -1 (conditional paddle bounce)",
+      "game.py line 50: self.score1 += 1 (score mutation on miss)",
+      "game.py line 51: self._reset_ball() (ball position/velocity reset)"
+    ],
+    "unauthenticated_access_confirmed": "test_app.py lines 45-47 (test_update_returns_success) sends POST /update with no auth header and asserts HTTP 200, confirming the endpoint is reachable and functional without credentials."
+  },
+  "semantic_correlation": "The historical incident involved state-mutating endpoints that trusted incoming requests by default and applied mutations without verifying caller identity. The candidate codebase introduces a new state-mutating endpoint /update that exhibits the identical behavioral pattern: it accepts requests from any caller, applies mutations to ball position, ball velocity, and player scores, and returns the updated state — all without any server-side authorization check. The mechanism is semantically identical to the original INC-042 failure: a POST endpoint that mutates live game state while trusting the request unconditionally. The recurrence is not based on keyword similarity; it is based on the concrete absence of any authorization gate before state-mutating logic in game.update(), applied to a newly added endpoint not present in the historical incident.",
+  "affected_files": [
+    "backend/app.py",
+    "backend/game.py",
+    "tests/test_app.py"
+  ],
+  "affected_behavior": "Any client with network access to the API can POST to /update without credentials and advance the game physics tick, mutate ball position and velocity, and increment either player's score. The /update endpoint is semantically equivalent to the historical /move and /reset violations: it is a state-changing endpoint callable by unauthenticated callers.",
+  "existing_test_gap": "The test suite includes tests that verify /move and /reset reject unauthenticated requests (test_unauthorized_move_is_rejected at line 36, test_unauthorized_reset_is_rejected at line 32). However, no test exists that verifies /update rejects unauthenticated requests. Worse, test_update_returns_success (line 45-47) actively asserts that /update returns HTTP 200 with no auth header, meaning the existing test suite explicitly encodes and validates the insecure behavior. There is no test that sends POST /update without an X-API-KEY header and expects a 401 response.",
+  "recommended_regression_target": "A test named test_unauthorized_update_is_rejected should POST to /update without the X-API-KEY header and assert the response status code is 401. This directly mirrors the existing test_unauthorized_move_is_rejected and test_unauthorized_reset_is_rejected tests and would have caught this recurrence at introduction time.",
+  "detected": true,
+  "recorded_at": "2026-09-27T10:02:14.641227+00:00",
+  "candidate_revision": "recurrence-demo",
+  "candidate_commit_sha": "d19deb5c0570e9422916bacb27e5c09a46187778",
+  "incident_sha256": "61d392113c78924493f562c8b94ca643b7fedfa036a3c7538dc563632feeec7e"
+}

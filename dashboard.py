@@ -14,6 +14,7 @@ API_BASE_URL = os.getenv(
 )
 
 REQUEST_TIMEOUT = 120
+BOB_REQUEST_TIMEOUT = 1000
 CLEANUP_TOKEN = os.getenv("NOREPEAT_CLEANUP_TOKEN", "").strip()
 
 
@@ -1382,6 +1383,8 @@ def clear_repository_source() -> None:
 def api_request(
     method: str,
     endpoint: str,
+    *,
+    request_timeout: int = REQUEST_TIMEOUT,
     **kwargs: Any,
 ) -> dict | None:
     """
@@ -1396,7 +1399,7 @@ def api_request(
         response = requests.request(
             method=method,
             url=url,
-            timeout=REQUEST_TIMEOUT,
+            timeout=request_timeout,
             **kwargs,
         )
 
@@ -2095,11 +2098,34 @@ if current_status.get("incident_memory_ready"):
     if memory:
         st.json(memory)
 else:
-    st.info(
-        "Prepared for IBM Bob integration. The backend endpoint "
-        "POST /api/sessions/<session_id>/incident-memory is ready, but this UI "
-        "does not fabricate incident memory before Bob is connected."
-    )
+    baseline = current_status.get("baseline") or {}
+    learn_enabled = bool(baseline.get("success"))
+
+    if st.button(
+        "Learn incident with IBM Bob",
+        type="primary",
+        disabled=not learn_enabled,
+    ):
+        with st.spinner(
+            "IBM Bob is learning the historical postmortem. This can take a few minutes..."
+        ):
+            payload = api_request(
+                "POST",
+                f"/api/sessions/{st.session_state.session_id}/bob/learn",
+                request_timeout=BOB_REQUEST_TIMEOUT,
+            )
+        if payload:
+            st.success("IBM Bob learned and persisted the historical incident memory.")
+            refresh_session_status()
+            st.rerun()
+
+    if not learn_enabled:
+        st.info("A passing baseline is required before Bob can learn the incident.")
+    else:
+        st.caption(
+            "Bob will read only the uploaded postmortem during this phase and will "
+            "persist structured Incident Memory automatically."
+        )
 
 # ---------------------------------------------------------------------
 # Step 5 - Historical recurrence analysis
@@ -2129,10 +2155,44 @@ if recurrence:
         st.success("No known historical recurrence detected for this candidate.")
     st.json(recurrence)
 else:
-    st.info(
-        "Waiting for Bob recurrence analysis. The backend endpoint "
-        "POST /api/sessions/<session_id>/recurrence-analysis is already prepared."
+    analyze_enabled = bool(
+        current_status.get("incident_memory_ready")
+        and (current_status.get("baseline") or {}).get("success")
     )
+
+    if st.button(
+        "Analyze recurrence with IBM Bob",
+        type="primary",
+        disabled=not analyze_enabled,
+    ):
+        with st.spinner(
+            "IBM Bob is comparing the candidate revision with Incident Memory..."
+        ):
+            payload = api_request(
+                "POST",
+                f"/api/sessions/{st.session_state.session_id}/bob/analyze",
+                request_timeout=BOB_REQUEST_TIMEOUT,
+            )
+        if payload:
+            result = payload.get("data", {})
+            analysis = result.get("analysis", {})
+            if analysis.get("detected"):
+                st.error("IBM Bob detected a historical recurrence.")
+            else:
+                st.success("IBM Bob found no known historical recurrence.")
+            refresh_session_status()
+            st.rerun()
+
+    if not analyze_enabled:
+        st.info(
+            "A passing baseline and persisted Incident Memory are required before "
+            "Bob can analyze recurrence."
+        )
+    else:
+        st.caption(
+            "Bob may use read-only parallel subagents to correlate the historical "
+            "root cause, candidate behavior and existing test coverage."
+        )
 
 st.divider()
 

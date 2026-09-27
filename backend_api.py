@@ -9,6 +9,13 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
 from core.cleanup_manager import cleanup_generated_runtime_data
+from core.bob_runner import (
+    BobExecutionError,
+    BobOutputError,
+    BobRunnerError,
+    BobShellNotFoundError,
+    BobTimeoutError,
+)
 from core.incident_manager import (
     IncidentManagerError,
     InvalidIncidentFileError,
@@ -18,12 +25,14 @@ from core.incident_manager import (
 from core.orchestrator import (
     InvalidSessionStateError,
     OrchestratorError,
+    analyze_recurrence_with_bob,
     attach_uploaded_incident,
     create_session_from_github,
     create_session_from_zip,
     delete_session,
     generate_proof_of_non_recurrence,
     get_session_status,
+    learn_incident_with_bob,
     record_incident_memory,
     record_recurrence_analysis,
     replay_incident,
@@ -276,6 +285,24 @@ def baseline(session_id: str):
     )
 
 
+@app.post("/api/sessions/<session_id>/bob/learn")
+def bob_learn_incident(session_id: str):
+    result = learn_incident_with_bob(session_id=session_id)
+    return api_response(
+        data=result,
+        message="IBM Bob learned and persisted the historical incident memory.",
+    )
+
+
+@app.post("/api/sessions/<session_id>/bob/analyze")
+def bob_analyze_recurrence(session_id: str):
+    result = analyze_recurrence_with_bob(session_id=session_id)
+    return api_response(
+        data=result,
+        message="IBM Bob completed and persisted the recurrence analysis.",
+    )
+
+
 @app.post("/api/sessions/<session_id>/incident-memory")
 def incident_memory(session_id: str):
     """
@@ -480,6 +507,39 @@ def handle_replay_timeout(error: ReplayTimeoutError):
     return api_response(
         message=str(error),
         status_code=408,
+    )
+
+
+@app.errorhandler(BobTimeoutError)
+def handle_bob_timeout(error: BobTimeoutError):
+    return api_response(
+        message=str(error),
+        status_code=504,
+    )
+
+
+@app.errorhandler(BobShellNotFoundError)
+def handle_bob_not_found(error: BobShellNotFoundError):
+    return api_response(
+        message=str(error),
+        status_code=503,
+    )
+
+
+@app.errorhandler(BobExecutionError)
+@app.errorhandler(BobOutputError)
+def handle_bob_execution_error(error: Exception):
+    return api_response(
+        message=str(error),
+        status_code=502,
+    )
+
+
+@app.errorhandler(BobRunnerError)
+def handle_bob_runner_error(error: BobRunnerError):
+    return api_response(
+        message=str(error),
+        status_code=500,
     )
 
 

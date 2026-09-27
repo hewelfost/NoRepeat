@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from core.cleanup_manager import remove_session_evidence
+from core.bob_runner import get_bob_runner
 from core.incident_manager import (
     get_session_workspace,
     import_incident_file,
@@ -40,6 +41,90 @@ class InvalidSessionStateError(OrchestratorError):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+
+
+def _project_relative(path: Path) -> str:
+    """Return a stable forward-slash path relative to the NoRepeat project root."""
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(PROJECT_ROOT.resolve())
+    except ValueError as exc:
+        raise OrchestratorError(
+            f"Path is outside the NoRepeat project root: {resolved}"
+        ) from exc
+    return relative.as_posix()
+
+
+def _load_bob_json_artifact(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        raise OrchestratorError(
+            f"IBM Bob completed the task but did not create the expected {label}: {path}"
+        )
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise OrchestratorError(
+            f"IBM Bob created an invalid JSON {label}: {path}"
+        ) from exc
+
+    if not isinstance(payload, dict) or not payload:
+        raise OrchestratorError(
+            f"IBM Bob {label} must be a non-empty JSON object."
+        )
+
+    return payload
+
+
+def _validate_learned_memory(memory: dict[str, Any]) -> None:
+    required = {
+        "incident_id",
+        "summary",
+        "root_cause",
+        "violated_security_property",
+        "historical_failure_pattern",
+        "recurrence_indicators",
+    }
+    missing = sorted(key for key in required if not memory.get(key))
+    if missing:
+        raise OrchestratorError(
+            "IBM Bob incident memory is missing required field(s): "
+            + ", ".join(missing)
+        )
+
+    if not isinstance(memory.get("recurrence_indicators"), list):
+        raise OrchestratorError(
+            "IBM Bob incident memory field 'recurrence_indicators' must be a list."
+        )
+
+
+def _validate_bob_recurrence_analysis(analysis: dict[str, Any]) -> None:
+    required = {
+        "incident_id",
+        "recurrence_detected",
+        "confidence",
+        "historical_root_cause",
+        "violated_security_property",
+        "candidate_evidence",
+        "semantic_correlation",
+        "affected_files",
+        "affected_behavior",
+        "existing_test_gap",
+        "recommended_regression_target",
+    }
+    missing = sorted(key for key in required if key not in analysis)
+    if missing:
+        raise OrchestratorError(
+            "IBM Bob recurrence analysis is missing required field(s): "
+            + ", ".join(missing)
+        )
+
+    if not isinstance(analysis.get("recurrence_detected"), bool):
+        raise OrchestratorError(
+            "IBM Bob recurrence analysis field 'recurrence_detected' must be boolean."
+        )
 
 
 def _manifest_path(session_id: str) -> Path:
@@ -321,6 +406,236 @@ def run_baseline(
     )
     _save_manifest(session_id, manifest)
     return result
+
+
+
+def learn_incident_with_bob(
+    session_id: str,
+) -> dict[str, Any]:
+    """Ask IBM Bob to learn only from the user-supplied historical postmortem."""
+    manifest = load_session_manifest(session_id)
+    _require_incident(manifest)
+
+    baseline = manifest.get("baseline")
+    if baseline is None:
+        raise InvalidSessionStateError(
+            "Run the candidate baseline before asking IBM Bob to learn the incident."
+        )
+    if not baseline.get("success"):
+        raise InvalidSessionStateError(
+            "The candidate baseline must pass before IBM Bob learns the incident."
+        )
+
+    incident = manifest["incident"]
+    incident_path = Path(str(incident.get("incident_path", ""))).resolve()
+    if not incident_path.exists():
+        raise OrchestratorError(
+            "The historical incident file referenced by the session no longer exists."
+        )
+
+    workspace = get_session_workspace(session_id)
+    analysis_dir = workspace / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    output_path = analysis_dir / "bob_incident_memory.json"
+    output_path.unlink(missing_ok=True)
+
+    incident_ref = _project_relative(incident_path)
+    output_ref = _project_relative(output_path)
+
+    prompt = f"""
+Perform only the Learn phase for NoRepeat session {session_id}.
+
+Historical postmortem supplied by the user:
+@{incident_ref}
+
+Rules:
+- Learn only from the historical postmortem.
+- Do not inspect the candidate repository.
+- Do not generate tests.
+- Do not modify application code.
+- Do not apply remediation.
+- Do not invent facts that are not supported by the postmortem.
+
+Create exactly one structured JSON object at:
+{output_ref}
+
+Required fields:
+- incident_id
+- summary
+- root_cause
+- violated_security_property
+- historical_failure_pattern
+- affected_behavior
+- recurrence_indicators
+- remediation_constraints
+
+The recurrence_indicators field must be a JSON array.
+Validate the JSON before finishing.
+Do not wrap the file contents in Markdown fences.
+
+At the end, report only that the memory artifact was created and validated.
+""".strip()
+
+    bob_result = get_bob_runner().run_norepeat(
+        prompt,
+        max_cost=0.40,
+        max_turns=8,
+        timeout_seconds=600,
+        allow_subagents=False,
+    )
+
+    memory = _load_bob_json_artifact(
+        output_path,
+        label="incident memory artifact",
+    )
+    _validate_learned_memory(memory)
+
+    updated_manifest = record_incident_memory(
+        session_id=session_id,
+        memory=memory,
+    )
+    updated_manifest["incident_memory"]["bob_execution"] = {
+        "task_id": bob_result.task_id,
+        "status": bob_result.status,
+        "stats": bob_result.stats,
+        "last_message": bob_result.last_message,
+        "artifact_path": str(output_path.resolve()),
+    }
+    updated_manifest["status"] = "INCIDENT_MEMORY_READY"
+    _save_manifest(session_id, updated_manifest)
+
+    return {
+        "incident_memory": updated_manifest["incident_memory"],
+        "bob": bob_result.to_dict(),
+    }
+
+
+def analyze_recurrence_with_bob(
+    session_id: str,
+) -> dict[str, Any]:
+    """Ask IBM Bob to compare the candidate revision with persisted incident memory."""
+    manifest = load_session_manifest(session_id)
+    _require_incident(manifest)
+    _require_incident_memory(manifest)
+
+    baseline = manifest.get("baseline")
+    if baseline is None or not baseline.get("success"):
+        raise InvalidSessionStateError(
+            "A passing candidate baseline is required before recurrence analysis."
+        )
+
+    workspace = get_session_workspace(session_id)
+    repository_path = Path(
+        str((manifest.get("repository") or {}).get("repository_path", ""))
+    ).resolve()
+    if not repository_path.exists() or not repository_path.is_dir():
+        raise OrchestratorError(
+            "The candidate repository referenced by this session no longer exists."
+        )
+
+    memory_path_raw = (manifest.get("incident_memory") or {}).get("memory_path")
+    if not memory_path_raw:
+        raise OrchestratorError("Persisted incident memory path is missing.")
+    memory_path = Path(str(memory_path_raw)).resolve()
+    if not memory_path.exists():
+        raise OrchestratorError("Persisted incident memory file no longer exists.")
+
+    analysis_dir = workspace / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    output_path = analysis_dir / "recurrence.json"
+    output_path.unlink(missing_ok=True)
+
+    memory_ref = _project_relative(memory_path)
+    repository_ref = _project_relative(repository_path)
+    output_ref = _project_relative(output_path)
+
+    prompt = f"""
+Perform only the Analyze phase for NoRepeat session {session_id}.
+
+Historical Incident Memory:
+@{memory_ref}
+
+Candidate repository:
+@{repository_ref}
+
+Goal:
+Determine whether the current candidate revision semantically repeats the historical root cause described in Incident Memory.
+
+Use up to 3 read-only parallel subagents when useful:
+1. Historical Pattern Analyst — identify the root cause, security property, and recurrence indicators.
+2. Candidate Code Analyst — inspect relevant behavior and controls in the candidate repository.
+3. Existing Tests Analyst — determine whether existing tests enforce the historical security property.
+
+Rules:
+- Do not assume recurrence exists.
+- Do not classify recurrence from keyword similarity alone.
+- Require concrete behavioral evidence.
+- Do not modify application code.
+- Do not generate regression tests.
+- Do not apply remediation.
+
+Persist the result as valid JSON at:
+{output_ref}
+
+Required fields:
+- incident_id
+- recurrence_detected
+- confidence
+- historical_root_cause
+- violated_security_property
+- candidate_evidence
+- semantic_correlation
+- affected_files
+- affected_behavior
+- existing_test_gap
+- recommended_regression_target
+
+recurrence_detected must be a JSON boolean.
+Validate the JSON before finishing.
+Do not wrap the file contents in Markdown fences.
+
+At the end report only:
+- recurrence detected: yes/no
+- affected component(s)
+- semantic reason
+- existing test gap
+- generated analysis file
+- validation result
+""".strip()
+
+    bob_result = get_bob_runner().run_norepeat(
+        prompt,
+        max_cost=0.80,
+        max_turns=12,
+        timeout_seconds=900,
+        allow_subagents=True,
+    )
+
+    analysis = _load_bob_json_artifact(
+        output_path,
+        label="recurrence analysis artifact",
+    )
+    _validate_bob_recurrence_analysis(analysis)
+
+    recorded = record_recurrence_analysis(
+        session_id=session_id,
+        analysis=analysis,
+    )
+
+    refreshed = load_session_manifest(session_id)
+    refreshed["recurrence_analysis"]["bob_execution"] = {
+        "task_id": bob_result.task_id,
+        "status": bob_result.status,
+        "stats": bob_result.stats,
+        "last_message": bob_result.last_message,
+        "artifact_path": str(output_path.resolve()),
+    }
+    _save_manifest(session_id, refreshed)
+
+    return {
+        "analysis": refreshed["recurrence_analysis"],
+        "bob": bob_result.to_dict(),
+    }
 
 
 def record_incident_memory(
