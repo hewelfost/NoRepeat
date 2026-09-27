@@ -18,6 +18,7 @@ from core.incident_manager import (
 )
 from core.repository_manager import (
     PROJECT_ROOT,
+    WORKSPACES_DIR,
     clone_github_repository,
     extract_zip_repository,
     remove_session_workspace,
@@ -255,6 +256,33 @@ def _clear_candidate_results(
     manifest["proof"] = {"status": "PENDING"}
 
 
+def _clear_candidate_workspace_artifacts(session_id: str) -> None:
+    """Delete generated files tied to the previous candidate revision.
+
+    Incident Memory is historical knowledge and is intentionally preserved so a
+    user can audit another branch/commit of the same repository without making
+    Bob relearn the postmortem. Candidate-specific analysis, proof and generated
+    repository artifacts must not survive a revision switch.
+    """
+    workspace = get_session_workspace(session_id)
+
+    analysis_dir = workspace / "analysis"
+    if analysis_dir.exists():
+        for child in list(analysis_dir.iterdir()):
+            # This artifact is derived only from the postmortem, not the
+            # candidate code, so it may be reused across revisions.
+            if child.name == "bob_incident_memory.json":
+                continue
+            if child.is_dir():
+                import shutil
+                shutil.rmtree(child)
+            elif child.is_file():
+                child.unlink()
+
+    proof_path = workspace / "proof_of_non_recurrence.json"
+    proof_path.unlink(missing_ok=True)
+
+
 def _clear_incident_derived_results(
     manifest: dict[str, Any],
 ) -> None:
@@ -301,6 +329,7 @@ def set_candidate_revision(
     manifest["repository"] = repository
 
     _clear_candidate_results(manifest)
+    _clear_candidate_workspace_artifacts(session_id)
     remove_session_evidence(session_id)
     manifest["status"] = _status_after_candidate_reset(manifest)
     _save_manifest(session_id, manifest)
@@ -1531,6 +1560,63 @@ def get_session_status(
         "verification": manifest.get("verification"),
         "proof": manifest.get("proof"),
     }
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    """Return resumable NoRepeat sessions, newest first.
+
+    Invalid/incomplete workspace folders are skipped instead of breaking the UI.
+    """
+    sessions: list[dict[str, Any]] = []
+
+    if not WORKSPACES_DIR.exists():
+        return sessions
+
+    for workspace in WORKSPACES_DIR.iterdir():
+        if not workspace.is_dir():
+            continue
+
+        manifest_path = workspace / SESSION_MANIFEST_NAME
+        if not manifest_path.exists() or not manifest_path.is_file():
+            continue
+
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(manifest, dict):
+            continue
+
+        repository = manifest.get("repository") or {}
+        incident = manifest.get("incident") or {}
+        sessions.append(
+            {
+                "session_id": manifest.get("session_id") or workspace.name,
+                "status": manifest.get("status"),
+                "created_at": manifest.get("created_at"),
+                "updated_at": manifest.get("updated_at"),
+                "repository": {
+                    "source_type": repository.get("source_type"),
+                    "source": repository.get("source"),
+                    "requested_revision": repository.get("requested_revision"),
+                    "resolved_revision": repository.get("resolved_revision"),
+                    "commit_sha": repository.get("commit_sha"),
+                },
+                "incident": {
+                    "filename": incident.get("filename"),
+                } if incident else None,
+                "baseline_passed": bool((manifest.get("baseline") or {}).get("success")),
+                "recurrence_detected": bool((manifest.get("recurrence_analysis") or {}).get("detected")),
+                "proof_status": (manifest.get("proof") or {}).get("status"),
+            }
+        )
+
+    sessions.sort(
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    return sessions
 
 
 def delete_session(session_id: str) -> bool:

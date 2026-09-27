@@ -275,7 +275,7 @@ st.markdown(
         color: var(--nr-purple-soft);
 
         font-family: var(--nr-font-mono);
-        font-size: 12px;
+        font-size: 14px;
         letter-spacing: 0.08em;
         text-transform: uppercase;
     }
@@ -429,7 +429,7 @@ st.markdown(
         color: var(--nr-purple-soft);
 
         font-family: var(--nr-font-mono);
-        font-size: 12px;
+        font-size: 14px;
 
         text-transform: uppercase;
         letter-spacing: 0.1em;
@@ -449,7 +449,7 @@ st.markdown(
     .nr-card-description {
         color: #B8ACC9;
 
-        font-size: 13px;
+        font-size: 14px;
         line-height: 1.55;
     }
 
@@ -492,7 +492,7 @@ st.markdown(
         color: var(--nr-purple-soft);
 
         font-family: var(--nr-font-mono);
-        font-size: 11px;
+        font-size: 14px;
 
         text-transform: uppercase;
     }
@@ -513,7 +513,7 @@ st.markdown(
 
         color: #8A7D9E;
 
-        font-size: 11px;
+        font-size: 14px;
     }
 
 
@@ -531,7 +531,7 @@ st.markdown(
         color: var(--nr-purple-soft);
 
         font-family: var(--nr-font-mono);
-        font-size: 12px;
+        font-size: 14px;
 
         letter-spacing: 0.12em;
         text-transform: uppercase;
@@ -594,7 +594,7 @@ st.markdown(
         background: #140B20;
 
         font-family: var(--nr-font-mono);
-        font-size: 12px;
+        font-size: 14px;
         letter-spacing: 0.04em;
 
         color: var(--nr-purple-soft);
@@ -607,7 +607,7 @@ st.markdown(
         color: #B8ACC9;
 
         font-family: var(--nr-font-mono);
-        font-size: 12px;
+        font-size: 14px;
         line-height: 1.8;
     }
 
@@ -857,7 +857,7 @@ st.markdown(
 
         color: var(--nr-text);
         font-family: var(--nr-font-sans);
-        font-size: 12.5px;
+        font-size: 14px;
         line-height: 1.45;
 
         box-shadow: 0 14px 30px rgba(0, 0, 0, 0.5);
@@ -874,7 +874,7 @@ st.markdown(
         color: var(--nr-purple-soft);
 
         font-family: var(--nr-font-mono);
-        font-size: 10px;
+        font-size: 14px;
         letter-spacing: 0.1em;
         text-transform: uppercase;
     }
@@ -957,7 +957,7 @@ st.markdown(
 
     @media (max-width: 850px) {
         .nr-bob-wrap { right: 14px; bottom: 14px; }
-        .nr-bob-bubble { max-width: 168px; font-size: 11.5px; padding: 8px 11px; }
+        .nr-bob-bubble { max-width: 168px; font-size: 14px; padding: 8px 11px; }
         .nr-bob-avatar { width: 54px; height: 54px; }
         .nr-bob-avatar svg { width: 34px; height: 34px; }
     }
@@ -982,7 +982,7 @@ st.markdown(
         margin-bottom: 6px;
         color: var(--nr-purple-soft);
         font-family: var(--nr-font-mono);
-        font-size: 11px;
+        font-size: 14px;
         letter-spacing: 0.12em;
         text-transform: uppercase;
     }
@@ -1048,8 +1048,16 @@ st.markdown(
     .nr-helper-line {
         margin-top: 9px;
         color: var(--nr-muted);
-        font-size: 12.5px;
+        font-size: 14px;
         line-height: 1.5;
+    }
+
+    /* Keep helper/caption text readable on desktop and in the sidebar. */
+    [data-testid="stCaptionContainer"] p,
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stMarkdownContainer"] small,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        font-size: 14px !important;
     }
 
     </style>
@@ -1073,6 +1081,19 @@ DEFAULT_STATE = {
     "remediation_result": None,
     "verification_result": None,
     "proof_result": None,
+}
+
+# Widget values that belong to one UI run. They must not leak into a new
+# session after cleanup/detach, otherwise an old repository/postmortem can be
+# submitted accidentally.
+WORKFLOW_WIDGET_KEYS = {
+    "repository_source_choice",
+    "repository_url_input",
+    "revision_to_audit_input",
+    "project_zip",
+    "change_candidate_revision",
+    "incident_report",
+    "resume_session_selector",
 }
 
 
@@ -1375,6 +1396,8 @@ def clear_repository_source() -> None:
     """Return the repository selector to its initial unselected state."""
     st.session_state["repository_source_choice"] = None
     st.session_state.pop("project_zip", None)
+    st.session_state.pop("repository_url_input", None)
+    st.session_state.pop("revision_to_audit_input", None)
 
 
 # ---------------------------------------------------------------------
@@ -1515,13 +1538,46 @@ def refresh_session_status() -> dict | None:
     return payload
 
 
-def reset_local_state(*, clear_query: bool = True) -> None:
-    """Reset local Streamlit state and optionally clear the resumable URL."""
+def reset_local_state(
+    *,
+    clear_query: bool = True,
+    clear_widgets: bool = False,
+) -> None:
+    """Reset local Streamlit state and optionally clear workflow widgets."""
     for key, default_value in DEFAULT_STATE.items():
         st.session_state[key] = default_value
 
+    if clear_widgets:
+        for key in WORKFLOW_WIDGET_KEYS:
+            st.session_state.pop(key, None)
+
     if clear_query:
         _clear_session_query_param()
+
+
+def detach_current_session() -> None:
+    """Leave the current session locally without deleting it from the backend."""
+    reset_local_state(clear_query=True, clear_widgets=True)
+
+
+def fetch_resumable_sessions() -> list[dict]:
+    """Return backend sessions that can be resumed from another browser visit."""
+    payload = api_request("GET", "/api/sessions")
+    if not payload:
+        return []
+
+    sessions = payload.get("data") or []
+    return sessions if isinstance(sessions, list) else []
+
+
+def session_option_label(item: dict) -> str:
+    repository = item.get("repository") or {}
+    revision = repository.get("requested_revision") or repository.get("resolved_revision") or "default"
+    commit = str(repository.get("commit_sha") or "")[:8]
+    status = item.get("status") or "UNKNOWN"
+    short_id = str(item.get("session_id") or "")[:8]
+    commit_part = f" · {commit}" if commit else ""
+    return f"{short_id} · {revision}{commit_part} · {status}"
 
 
 # ---------------------------------------------------------------------
@@ -1782,6 +1838,10 @@ with st.sidebar:
     st.header("System")
     bob_sidebar_placeholder = st.empty()
 
+    cleanup_notice = st.session_state.pop("_cleanup_notice", None)
+    if cleanup_notice:
+        st.success(cleanup_notice)
+
     backend_healthy = check_backend_health()
     if backend_healthy:
         st.success("Backend connected")
@@ -1789,6 +1849,39 @@ with st.sidebar:
         st.error("Backend unavailable")
 
     st.caption(API_BASE_URL)
+
+    if backend_healthy:
+        with st.expander("Resume existing session"):
+            resumable_sessions = fetch_resumable_sessions()
+            if resumable_sessions:
+                session_by_id = {
+                    str(item.get("session_id")): item
+                    for item in resumable_sessions
+                    if item.get("session_id")
+                }
+                session_ids = list(session_by_id)
+                selected_session_id = st.selectbox(
+                    "Saved session",
+                    session_ids,
+                    format_func=lambda value: session_option_label(
+                        session_by_id[value]
+                    ),
+                    key="resume_session_selector",
+                )
+
+                if st.button(
+                    "Resume selected session",
+                    use_container_width=True,
+                ):
+                    payload = api_request(
+                        "GET",
+                        f"/api/sessions/{selected_session_id}",
+                    )
+                    if payload:
+                        activate_session(payload["data"])
+                        st.rerun()
+            else:
+                st.caption("No resumable sessions are stored on the backend.")
 
     if st.session_state.session_id:
         st.divider()
@@ -1799,29 +1892,40 @@ with st.sidebar:
             refresh_session_status()
             st.rerun()
 
-        if st.button("Delete session", use_container_width=True):
+        if st.button(
+            "Start another session",
+            use_container_width=True,
+            help=(
+                "Leaves this session saved on the backend so you can resume it later. "
+                "No generated files are mixed with the new session."
+            ),
+        ):
+            detach_current_session()
+            st.rerun()
+
+        if st.button("Delete this session", use_container_width=True):
             payload = api_request(
                 "DELETE",
                 f"/api/sessions/{st.session_state.session_id}",
             )
             if payload:
-                reset_local_state()
+                reset_local_state(clear_widgets=True)
+                st.session_state["_cleanup_notice"] = "Session deleted."
                 st.rerun()
 
     st.divider()
     with st.expander("Maintenance / clean runtime data"):
         st.caption(
-            "Deletes generated sessions, cloned repositories, runtime evidence and "
-            "caches. Preserves .bob/, AGENTS.md, bob_sessions/, data/guards/ and "
-            "data/incidents/. Learned incident memories are archived to data/guards/."
+            "Hard reset: immediately deletes every generated runtime session, cloned "
+            "candidate, uploaded session copy, Incident Memory, recurrence evidence, "
+            "generated guard, replay/remediation/verification/proof artifact and cache. "
+            "It preserves the NoRepeat source, .bob/, AGENTS.md, bob_sessions/ and "
+            "predefined data/incidents/."
         )
-        cleanup_confirmed = st.checkbox(
-            "I understand this will remove all active runtime sessions.",
-            key="cleanup_runtime_confirmed",
-        )
+
         if st.button(
-            "Clean generated runtime data",
-            disabled=not cleanup_confirmed,
+            "Clean all generated runtime data",
+            type="primary",
             use_container_width=True,
         ):
             headers = {}
@@ -1835,12 +1939,10 @@ with st.sidebar:
             )
             if payload:
                 report = payload.get("data") or {}
-                reset_local_state()
-                st.success(
-                    "Runtime data cleaned. "
-                    f"Sessions removed: {report.get('workspaces_removed', 0)}. "
-                    f"Incident memories archived: "
-                    f"{len(report.get('archived_incident_memories', []))}."
+                reset_local_state(clear_widgets=True)
+                st.session_state["_cleanup_notice"] = (
+                    "Runtime cleaned completely. "
+                    f"Sessions removed: {report.get('workspaces_removed', 0)}."
                 )
                 st.rerun()
 
@@ -1860,119 +1962,138 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-source_col, clear_col = st.columns([0.92, 0.08], vertical_alignment="bottom")
-
-with source_col:
-    repository_source = st.radio(
-        "Project source",
-        ["GitHub repository", "ZIP upload"],
-        index=None,
-        horizontal=True,
-        key="repository_source_choice",
-    )
-
-with clear_col:
-    if repository_source is not None:
-        st.button(
-            "✕",
-            key="clear_repository_source",
-            help="Clear project source",
-            use_container_width=True,
-            on_click=clear_repository_source,
-        )
-
 repository_url = ""
 revision_to_audit = ""
 uploaded_zip = None
+repository_source = None
 
-if repository_source is None:
-    st.caption("Choose GitHub repository or ZIP upload to begin.")
+if not st.session_state.session_id:
+    source_col, clear_col = st.columns([0.92, 0.08], vertical_alignment="bottom")
 
-elif repository_source == "GitHub repository":
-    repository_url = st.text_input(
-        "Public GitHub repository URL",
-        placeholder="https://github.com/your-team/norepeat-demo-app",
-    )
-    revision_to_audit = st.text_input(
-        "Revision to audit (optional)",
-        placeholder="main, feature/admin-export, v1.2.0, or commit SHA",
-        help=(
-            "Leave blank to audit the repository's default checked-out revision. "
-            "For the demo, use the branch or commit that represents the new change."
+    with source_col:
+        repository_source = st.radio(
+            "Project source",
+            ["GitHub repository", "ZIP upload"],
+            index=None,
+            horizontal=True,
+            key="repository_source_choice",
+        )
+
+    with clear_col:
+        if repository_source is not None:
+            st.button(
+                "✕",
+                key="clear_repository_source",
+                help="Clear project source",
+                use_container_width=True,
+                on_click=clear_repository_source,
+            )
+
+    if repository_source is None:
+        st.caption("Choose GitHub repository or ZIP upload to begin.")
+
+    elif repository_source == "GitHub repository":
+        repository_url = st.text_input(
+            "Public GitHub repository URL",
+            placeholder="https://github.com/your-team/norepeat-demo-app",
+            key="repository_url_input",
+        )
+        revision_to_audit = st.text_input(
+            "Revision to audit (optional)",
+            placeholder="main, feature/admin-export, v1.2.0, or commit SHA",
+            key="revision_to_audit_input",
+            help=(
+                "Leave blank to audit the repository's default checked-out revision. "
+                "For the demo, use the branch or commit that represents the new change."
+            ),
+        )
+
+        if st.button("Load candidate revision", type="primary"):
+            if not repository_url.strip():
+                st.warning("Enter a GitHub repository URL.")
+            else:
+                with st.spinner("Cloning repository and preparing candidate revision..."):
+                    payload = api_request(
+                        "POST",
+                        "/api/sessions/github",
+                        json={
+                            "repository_url": repository_url.strip(),
+                            "revision": revision_to_audit.strip() or None,
+                        },
+                    )
+
+                if payload:
+                    activate_session(payload["data"])
+                    st.rerun()
+
+    elif repository_source == "ZIP upload":
+        uploaded_zip = st.file_uploader(
+            "Upload candidate ZIP snapshot",
+            type=["zip"],
+            key="project_zip",
+        )
+        st.caption(
+            "ZIP mode audits exactly the uploaded snapshot; it has no Git revision selector."
+        )
+
+        if st.button("Load ZIP snapshot", type="primary"):
+            if uploaded_zip is None:
+                st.warning("Select a ZIP project first.")
+            else:
+                with st.spinner("Preparing project workspace..."):
+                    payload = api_request(
+                        "POST",
+                        "/api/sessions/zip",
+                        files={
+                            "project": (
+                                uploaded_zip.name,
+                                uploaded_zip.getvalue(),
+                                "application/zip",
+                            )
+                        },
+                    )
+
+                if payload:
+                    activate_session(payload["data"])
+                    st.rerun()
+
+    uploaded_zip_name = uploaded_zip.name if uploaded_zip is not None else None
+    render_bob_assistant_panel(
+        bob_sidebar_placeholder,
+        resolve_bob_assistant_state(
+            repository_source=repository_source,
+            repository_url=repository_url,
+            uploaded_zip_name=uploaded_zip_name,
         ),
     )
 
-    if st.button("Load candidate revision", type="primary"):
-        if not repository_url.strip():
-            st.warning("Enter a GitHub repository URL.")
-        else:
-            with st.spinner("Cloning repository and preparing candidate revision..."):
-                payload = api_request(
-                    "POST",
-                    "/api/sessions/github",
-                    json={
-                        "repository_url": repository_url.strip(),
-                        "revision": revision_to_audit.strip() or None,
-                    },
-                )
-
-            if payload:
-                manifest = payload["data"]
-                activate_session(manifest)
-                st.rerun()
-
-elif repository_source == "ZIP upload":
-    uploaded_zip = st.file_uploader(
-        "Upload candidate ZIP snapshot",
-        type=["zip"],
-        key="project_zip",
+    if not st.session_state.session_id:
+        st.info("Load candidate code to begin a NoRepeat session.")
+        st.stop()
+else:
+    st.info(
+        "This browser is attached to an existing NoRepeat session. "
+        "Use ‘Start another session’ in the sidebar to load a different repository "
+        "without deleting this resumable session."
     )
-    st.caption("ZIP mode audits exactly the uploaded snapshot; it has no Git revision selector.")
-
-    if st.button("Load ZIP snapshot", type="primary"):
-        if uploaded_zip is None:
-            st.warning("Select a ZIP project first.")
-        else:
-            with st.spinner("Preparing project workspace..."):
-                payload = api_request(
-                    "POST",
-                    "/api/sessions/zip",
-                    files={
-                        "project": (
-                            uploaded_zip.name,
-                            uploaded_zip.getvalue(),
-                            "application/zip",
-                        )
-                    },
-                )
-
-            if payload:
-                manifest = payload["data"]
-                activate_session(manifest)
-                st.rerun()
-
-uploaded_zip_name = uploaded_zip.name if uploaded_zip is not None else None
-render_bob_assistant_panel(
-    bob_sidebar_placeholder,
-    resolve_bob_assistant_state(
-        repository_source=repository_source,
-        repository_url=repository_url,
-        uploaded_zip_name=uploaded_zip_name,
-    ),
-)
-
-if not st.session_state.session_id:
-    st.info("Load candidate code to begin a NoRepeat session.")
-    st.stop()
 
 refresh_session_status()
 current_status = st.session_state.session_status or {}
 show_repository_summary(current_status)
 
-# Allow switching candidate revision without losing learned incident memory.
+# Allow switching branch/tag/commit inside the same GitHub repository while
+# preserving the postmortem and learned Incident Memory. Candidate-specific
+# generated files are removed server-side before the new baseline.
 repository_meta = current_status.get("repository") or {}
 if repository_meta.get("supports_revision_switching"):
     with st.expander("Change candidate revision"):
+        st.caption(
+            "Use this when a branch/commit has no recurrence and you want to audit "
+            "another revision of the same repository. NoRepeat keeps the historical "
+            "postmortem/Incident Memory, but removes the previous candidate's baseline, "
+            "recurrence analysis, generated guard, replay, remediation, verification, "
+            "proof and repository-generated files."
+        )
         new_revision = st.text_input(
             "Branch, tag or commit",
             key="change_candidate_revision",
@@ -1982,19 +2103,15 @@ if repository_meta.get("supports_revision_switching"):
             if not new_revision.strip():
                 st.warning("Enter a revision first.")
             else:
-                payload = api_request(
-                    "PATCH",
-                    f"/api/sessions/{st.session_state.session_id}/revision",
-                    json={"revision": new_revision.strip()},
-                )
+                with st.spinner("Switching revision and cleaning previous candidate artifacts..."):
+                    payload = api_request(
+                        "PATCH",
+                        f"/api/sessions/{st.session_state.session_id}/revision",
+                        json={"revision": new_revision.strip()},
+                    )
                 if payload:
-                    st.session_state.session_status = payload["data"]
-                    st.session_state.baseline_result = None
-                    st.session_state.recurrence_analysis = None
-                    st.session_state.replay_result = None
-                    st.session_state.remediation_result = None
-                    st.session_state.verification_result = None
-                    st.session_state.proof_result = None
+                    activate_session(payload["data"])
+                    st.success("Candidate revision switched cleanly.")
                     st.rerun()
 
 st.divider()

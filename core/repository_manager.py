@@ -400,7 +400,12 @@ def switch_session_revision(
     session_id: str,
     revision: str,
 ) -> dict:
-    """Switch an existing GitHub session to another candidate revision."""
+    """Switch an existing GitHub session to another candidate revision safely.
+
+    The requested revision is resolved *before* destructive cleanup. This means
+    a typo or nonexistent branch cannot wipe generated files while leaving the
+    manifest pointing at the previous candidate.
+    """
     _check_git_available()
     repository_path = get_session_repository_path(session_id)
 
@@ -409,10 +414,28 @@ def switch_session_revision(
             "Revision switching is available only for Git repositories."
         )
 
-    # The session repository is a disposable audit clone. Remove modifications
-    # and untracked/ignored artifacts from the previous candidate before the
-    # checkout so generated tests or pytest caches cannot contaminate the next
-    # baseline.
+    requested_revision = validate_revision(revision)
+    if requested_revision is None:
+        raise InvalidRevisionError("A branch, tag, or commit is required.")
+
+    # Refresh remote refs first, but do not touch the current working tree yet.
+    _run_git(
+        repository_path,
+        ["fetch", "--all", "--prune", "--tags"],
+        timeout=120,
+    )
+
+    commit_sha = _try_resolve_revision(repository_path, requested_revision)
+    if commit_sha is None:
+        raise InvalidRevisionError(
+            f"Unable to resolve revision '{requested_revision}'. "
+            "The current session was left unchanged. Use a branch, tag, or "
+            "commit SHA that exists in the repository."
+        )
+
+    # Only after the new revision is known to exist do we clean the disposable
+    # audit clone. This removes Bob-generated tests, pytest caches and any
+    # remediation changes from the previous candidate.
     head_check = _run_git(
         repository_path,
         ["rev-parse", "--verify", "HEAD"],
@@ -421,21 +444,22 @@ def switch_session_revision(
     )
     if head_check.returncode == 0:
         _run_git(repository_path, ["reset", "--hard", "HEAD"], timeout=30)
-    _run_git(repository_path, ["clean", "-fdx"], timeout=30)
 
-    revision_metadata = checkout_repository_revision(
+    _run_git(repository_path, ["clean", "-fdx"], timeout=30)
+    _run_git(
         repository_path,
-        revision,
-        fetch_if_missing=True,
+        ["checkout", "--detach", "--force", commit_sha],
+        timeout=30,
     )
 
     return {
         "success": True,
         "session_id": session_id,
         "repository_path": str(repository_path),
-        **revision_metadata,
+        "requested_revision": requested_revision,
+        "resolved_revision": requested_revision,
+        "commit_sha": commit_sha,
     }
-
 
 def _is_zip_symlink(zip_info: zipfile.ZipInfo) -> bool:
     """Return True if a ZIP entry represents a symbolic link."""

@@ -34,6 +34,7 @@ from core.orchestrator import (
     generate_regression_guard_with_bob,
     get_session_status,
     learn_incident_with_bob,
+    list_sessions,
     record_incident_memory,
     record_recurrence_analysis,
     remediate_with_bob,
@@ -126,15 +127,24 @@ def health():
 
 @app.post("/api/runtime/cleanup")
 def cleanup_runtime():
-    """Delete generated runtime artifacts while preserving Bob assets/memory."""
+    """Hard-reset generated runtime artifacts while preserving project defaults."""
     require_cleanup_authorization()
     report = cleanup_generated_runtime_data()
     return api_response(
         data=report,
         message=(
             "Generated runtime data cleaned successfully. "
-            "Bob configuration, task evidence and durable incident memory were preserved."
+            "Bob project configuration and predefined source assets were preserved."
         ),
+    )
+
+
+@app.get("/api/sessions")
+def sessions_index():
+    """List resumable NoRepeat sessions, newest first."""
+    return api_response(
+        data=list_sessions(),
+        message="Resumable sessions retrieved.",
     )
 
 

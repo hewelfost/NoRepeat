@@ -33,11 +33,8 @@ Thumbs.db
 *.tmp
 *.temp
 
-# Repositorios y workspaces temporales analizados por NoRepeat
+# Runtime generado por NoRepeat
 workspaces/
-
-# Evidencia runtime regenerable
 data/evidence/*.json
-
-# Memorias archivadas por el botón de limpieza (runtime local)
-data/guards/incident_memory_archive/
+data/guards/*
+!data/guards/.gitkeep
