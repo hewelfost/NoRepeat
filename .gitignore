@@ -1,4 +1,4 @@
-# Entorno virtual
+# Entornos virtuales
 .venv/
 venv/
 
@@ -31,7 +31,13 @@ Thumbs.db
 
 # Archivos temporales
 *.tmp
-*.temp 
+*.temp
 
-#Repositorios y workspaces temporales analizados por NoRepeat
+# Repositorios y workspaces temporales analizados por NoRepeat
 workspaces/
+
+# Evidencia runtime regenerable
+data/evidence/*.json
+
+# Memorias archivadas por el botón de limpieza (runtime local)
+data/guards/incident_memory_archive/

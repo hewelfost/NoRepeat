@@ -1619,6 +1619,8 @@ def display_workflow_status() -> None:
     verification = status.get("verification")
     proof = status.get("proof") or {}
 
+    guard = status.get("regression_guard")
+
     steps = [
         ("Candidate", "done" if status.get("repository") else "pending"),
         ("Postmortem", "done" if status.get("incident") else "pending"),
@@ -1635,6 +1637,7 @@ def display_workflow_status() -> None:
             else "done" if recurrence is not None
             else "pending",
         ),
+        ("Guard", "done" if guard else "pending"),
         (
             "Replay",
             "detected" if replay and replay.get("incident_reproduced")
@@ -1651,10 +1654,9 @@ def display_workflow_status() -> None:
     ]
 
     st.subheader("Historical recurrence workflow")
-    first_row = st.columns(4)
-    second_row = st.columns(4)
+    columns = st.columns(3) + st.columns(3) + st.columns(3)
 
-    for column, (name, state) in zip(first_row + second_row, steps):
+    for column, (name, state) in zip(columns, steps):
         if state == "done":
             column.success(f"✓ {name}")
         elif state == "detected":
@@ -2197,46 +2199,108 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------
-# Step 6 - Incident replay
+# Step 6 - Regression guard generation
 # ---------------------------------------------------------------------
 
 st.markdown(
     """
-    <div class="nr-section-label">STEP 06 · INCIDENT REPLAY</div>
-    <div class="nr-section-title">Prove the recurrence</div>
+    <div class="nr-section-label">STEP 06 · REGRESSION GUARD</div>
+    <div class="nr-section-title">Turn the recurrence into a permanent test</div>
     <div class="nr-section-description">
-        If Bob detects recurrence, it creates a regression test. A failing replay before
-        remediation is evidence that the historical condition can be reproduced.
+        Bob converts the detected historical recurrence into one deterministic pytest
+        regression guard. Bob is not allowed to modify production code or remediate
+        the issue during this phase.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-incident_test_path = st.text_input(
-    "Generated regression test path",
-    value="tests/generated/test_INC_042.py",
-)
-
-replay_enabled = bool(
+recurrence_detected = bool(
     recurrence
     and (
         recurrence.get("detected") is True
         or recurrence.get("recurrence_detected") is True
     )
 )
+
+guard = current_status.get("regression_guard") or {}
+
+if guard:
+    st.success("IBM Bob regression guard is ready.")
+    st.code(guard.get("test_path", "Generated test path unavailable"), language="text")
+    if guard.get("security_property"):
+        st.caption(f"Security property: {guard.get('security_property')}")
+else:
+    if st.button(
+        "Generate regression guard with IBM Bob",
+        type="primary",
+        disabled=not recurrence_detected,
+    ):
+        with st.spinner(
+            "IBM Bob is generating the historical regression guard..."
+        ):
+            payload = api_request(
+                "POST",
+                f"/api/sessions/{st.session_state.session_id}/bob/generate-guard",
+                request_timeout=BOB_REQUEST_TIMEOUT,
+            )
+        if payload:
+            result = payload.get("data", {})
+            generated_guard = result.get("guard", {})
+            st.success(
+                "IBM Bob generated the regression guard: "
+                + str(generated_guard.get("test_path", "test created"))
+            )
+            refresh_session_status()
+            st.rerun()
+
+    if not recurrence_detected:
+        st.caption(
+            "Guard generation unlocks only after IBM Bob detects a historical recurrence."
+        )
+
+st.divider()
+
+# ---------------------------------------------------------------------
+# Step 7 - Incident replay
+# ---------------------------------------------------------------------
+
+st.markdown(
+    """
+    <div class="nr-section-label">STEP 07 · INCIDENT REPLAY</div>
+    <div class="nr-section-title">Prove the recurrence</div>
+    <div class="nr-section-description">
+        NoRepeat independently runs Bob's generated regression guard. A failing replay
+        before remediation is evidence that the historical condition can be reproduced.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+incident_test_path = str(guard.get("test_path") or "")
+if incident_test_path:
+    st.text_input(
+        "Generated regression test path",
+        value=incident_test_path,
+        disabled=True,
+    )
+else:
+    st.info("Generate the regression guard before running incident replay.")
+
+replay_enabled = bool(recurrence_detected and incident_test_path)
 if st.button("Run incident replay", disabled=not replay_enabled):
     with st.spinner("Replaying historical recurrence..."):
         payload = api_request(
             "POST",
             f"/api/sessions/{st.session_state.session_id}/replay",
-            json={"incident_test_path": incident_test_path.strip()},
+            json={"incident_test_path": incident_test_path},
         )
     if payload:
         st.session_state.replay_result = payload["data"]
         refresh_session_status()
 
 if not replay_enabled:
-    st.caption("Replay unlocks only after Bob records a detected historical recurrence.")
+    st.caption("Replay unlocks after IBM Bob generates the regression guard.")
 
 if st.session_state.replay_result:
     show_pytest_result(
@@ -2247,12 +2311,12 @@ if st.session_state.replay_result:
 st.divider()
 
 # ---------------------------------------------------------------------
-# Step 7 - Bob remediation + verification
+# Step 8 - Bob remediation + verification
 # ---------------------------------------------------------------------
 
 st.markdown(
     """
-    <div class="nr-section-label">STEP 07 · REMEDIATE & VERIFY</div>
+    <div class="nr-section-label">STEP 08 · REMEDIATE & VERIFY</div>
     <div class="nr-section-title">Fix without erasing the evidence</div>
     <div class="nr-section-description">
         Bob should apply the smallest justified remediation, preserve the regression
@@ -2270,7 +2334,7 @@ if st.button("Verify after Bob fix", disabled=not verify_enabled):
         payload = api_request(
             "POST",
             f"/api/sessions/{st.session_state.session_id}/verify",
-            json={"incident_test_path": incident_test_path.strip()},
+            json={"incident_test_path": incident_test_path},
         )
     if payload:
         st.session_state.verification_result = payload["data"]
@@ -2287,12 +2351,12 @@ if st.session_state.verification_result:
 st.divider()
 
 # ---------------------------------------------------------------------
-# Step 8 - Proof
+# Step 9 - Proof
 # ---------------------------------------------------------------------
 
 st.markdown(
     """
-    <div class="nr-section-label">STEP 08 · AUDIT EVIDENCE</div>
+    <div class="nr-section-label">STEP 09 · AUDIT EVIDENCE</div>
     <div class="nr-section-title">Proof of Non-Recurrence</div>
     <div class="nr-section-description">
         The final artifact links the user postmortem, persisted incident memory,

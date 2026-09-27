@@ -31,6 +31,7 @@ from core.orchestrator import (
     create_session_from_zip,
     delete_session,
     generate_proof_of_non_recurrence,
+    generate_regression_guard_with_bob,
     get_session_status,
     learn_incident_with_bob,
     record_incident_memory,
@@ -300,6 +301,15 @@ def bob_analyze_recurrence(session_id: str):
     return api_response(
         data=result,
         message="IBM Bob completed and persisted the recurrence analysis.",
+    )
+
+
+@app.post("/api/sessions/<session_id>/bob/generate-guard")
+def bob_generate_regression_guard(session_id: str):
+    result = generate_regression_guard_with_bob(session_id=session_id)
+    return api_response(
+        data=result,
+        message="IBM Bob generated and registered the historical regression guard.",
     )
 
 

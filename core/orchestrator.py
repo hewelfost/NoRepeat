@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -203,6 +204,7 @@ def _create_manifest(
         "incident_memory": None,
         "baseline": None,
         "recurrence_analysis": None,
+        "regression_guard": None,
         "replay": None,
         "verification": None,
         "proof": {
@@ -244,6 +246,7 @@ def _clear_candidate_results(
     """
     manifest["baseline"] = None
     manifest["recurrence_analysis"] = None
+    manifest["regression_guard"] = None
     manifest["replay"] = None
     manifest["verification"] = None
     manifest["proof"] = {"status": "PENDING"}
@@ -754,6 +757,7 @@ def record_recurrence_analysis(
     enriched["evidence_path"] = str(evidence_path)
 
     manifest["recurrence_analysis"] = enriched
+    manifest["regression_guard"] = None
     manifest["replay"] = None
     manifest["verification"] = None
     manifest["proof"] = {"status": "PENDING"}
@@ -766,6 +770,179 @@ def record_recurrence_analysis(
     return enriched
 
 
+def _guard_filename(incident_id: str) -> str:
+    """Return a stable pytest filename for one historical incident id."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(incident_id)).strip("_")
+    if not cleaned:
+        cleaned = "incident"
+    return f"test_{cleaned}.py"
+
+
+def _require_regression_guard(manifest: dict[str, Any]) -> dict[str, Any]:
+    guard = manifest.get("regression_guard")
+    if not guard:
+        raise InvalidSessionStateError(
+            "Generate the IBM Bob regression guard before replaying the incident."
+        )
+    return guard
+
+
+def generate_regression_guard_with_bob(
+    session_id: str,
+) -> dict[str, Any]:
+    """Ask IBM Bob to generate only the regression test for a detected recurrence."""
+    manifest = load_session_manifest(session_id)
+    _require_incident(manifest)
+    _require_incident_memory(manifest)
+    analysis = _require_recurrence(manifest)
+
+    baseline = manifest.get("baseline") or {}
+    if not baseline.get("success"):
+        raise InvalidSessionStateError(
+            "A passing candidate baseline is required before guard generation."
+        )
+
+    repository_path = Path(
+        str((manifest.get("repository") or {}).get("repository_path", ""))
+    ).resolve()
+    if not repository_path.exists() or not repository_path.is_dir():
+        raise OrchestratorError(
+            "The candidate repository referenced by this session no longer exists."
+        )
+
+    memory_path_raw = (manifest.get("incident_memory") or {}).get("memory_path")
+    if not memory_path_raw:
+        raise OrchestratorError("Persisted incident memory path is missing.")
+    memory_path = Path(str(memory_path_raw)).resolve()
+    if not memory_path.exists():
+        raise OrchestratorError("Persisted incident memory file no longer exists.")
+
+    workspace = get_session_workspace(session_id)
+    analysis_dir = workspace / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    recurrence_path = analysis_dir / "recurrence.json"
+
+    # Keep a canonical analysis artifact available even if the original Bob-created
+    # file was removed after the analysis had already been persisted in the manifest.
+    if not recurrence_path.exists():
+        recurrence_payload = {
+            key: value
+            for key, value in analysis.items()
+            if key not in {"bob_execution", "evidence_path", "recorded_at"}
+        }
+        recurrence_path.write_text(
+            json.dumps(recurrence_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    memory = (manifest.get("incident_memory") or {}).get("memory") or {}
+    incident_id = str(memory.get("incident_id") or analysis.get("incident_id") or "INCIDENT")
+
+    generated_dir = repository_path / "tests" / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    output_path = generated_dir / _guard_filename(incident_id)
+    output_path.unlink(missing_ok=True)
+
+    memory_ref = _project_relative(memory_path)
+    recurrence_ref = _project_relative(recurrence_path)
+    repository_ref = _project_relative(repository_path)
+    output_ref = _project_relative(output_path)
+
+    prompt = f"""
+Perform only the Test phase for NoRepeat session {session_id}.
+
+Historical Incident Memory:
+@{memory_ref}
+
+Persisted recurrence analysis:
+@{recurrence_ref}
+
+Candidate repository:
+@{repository_ref}
+
+Goal:
+Create one deterministic pytest regression test that proves the concrete detected
+recurrence and permanently encodes the historical security property.
+
+Write exactly one test file at:
+{output_ref}
+
+Rules:
+- Use the candidate repository's existing pytest conventions and fixtures.
+- Target the concrete behavior identified by recurrence.json.
+- The test must encode the historical security property, not merely check keywords.
+- The test should FAIL on the current recurring revision for the expected security reason.
+- The test should PASS after a correct minimal remediation.
+- Do not modify production/application code.
+- Do not modify existing baseline tests.
+- Do not delete, skip, xfail, weaken, or bypass the generated regression test.
+- Do not apply remediation in this phase.
+- Do not create additional files outside the requested regression test.
+- Do not perform network calls from the test.
+- Do not execute pytest yet; NoRepeat will perform replay independently.
+- You may validate Python syntax only.
+
+At the end report only:
+- generated test path
+- behavior guarded
+- why the current candidate should fail it
+- syntax validation result
+""".strip()
+
+    bob_result = get_bob_runner().run_norepeat(
+        prompt,
+        max_cost=0.55,
+        max_turns=8,
+        timeout_seconds=600,
+        allow_subagents=False,
+    )
+
+    if not output_path.exists() or not output_path.is_file():
+        raise OrchestratorError(
+            "IBM Bob completed guard generation but did not create the expected "
+            f"regression test: {output_path}"
+        )
+
+    source = output_path.read_text(encoding="utf-8")
+    if not source.strip():
+        raise OrchestratorError("IBM Bob generated an empty regression test file.")
+
+    try:
+        compile(source, str(output_path), "exec")
+    except SyntaxError as exc:
+        raise OrchestratorError(
+            f"IBM Bob generated a regression test with invalid Python syntax: {exc}"
+        ) from exc
+
+    test_path = output_path.relative_to(repository_path).as_posix()
+    guard = {
+        "incident_id": incident_id,
+        "test_path": test_path,
+        "absolute_path": str(output_path.resolve()),
+        "created_at": _utc_now(),
+        "behavior_guarded": analysis.get("affected_behavior"),
+        "security_property": analysis.get("violated_security_property"),
+        "bob_execution": {
+            "task_id": bob_result.task_id,
+            "status": bob_result.status,
+            "stats": bob_result.stats,
+            "last_message": bob_result.last_message,
+        },
+    }
+
+    manifest["regression_guard"] = guard
+    manifest["replay"] = None
+    manifest["verification"] = None
+    manifest["proof"] = {"status": "PENDING"}
+    manifest["status"] = "REGRESSION_GUARD_READY"
+    _save_manifest(session_id, manifest)
+
+    return {
+        "guard": guard,
+        "bob": bob_result.to_dict(),
+    }
+
+
 def replay_incident(
     session_id: str,
     incident_test_path: str,
@@ -775,6 +952,16 @@ def replay_incident(
     _require_incident(manifest)
     _require_incident_memory(manifest)
     _require_recurrence(manifest)
+    guard = _require_regression_guard(manifest)
+
+    expected_test_path = str(guard.get("test_path") or "").strip()
+    if not expected_test_path:
+        raise OrchestratorError("Generated regression guard test path is missing.")
+    if incident_test_path.strip().replace("\\", "/") != expected_test_path:
+        raise InvalidSessionStateError(
+            "Replay must use the regression test generated by IBM Bob: "
+            + expected_test_path
+        )
 
     result = run_incident_replay(
         session_id=session_id,
@@ -1009,6 +1196,8 @@ def get_session_status(
         "recurrence_analysis_completed": (
             manifest.get("recurrence_analysis") is not None
         ),
+        "regression_guard": manifest.get("regression_guard"),
+        "regression_guard_ready": manifest.get("regression_guard") is not None,
         "incident_replay_completed": manifest.get("replay") is not None,
         "replay": manifest.get("replay"),
         "verification_completed": manifest.get("verification") is not None,
